@@ -1,0 +1,763 @@
+#!/usr/bin/env python3
+"""
+P6000 Protek Power Supply Interactive CLI
+Interactive command-line interface exactly like hans_cli.py pattern.
+
+This is the INTERACTIVE DRIVER that calls the P6000PowerSupply library.
+"""
+
+import sys
+import time
+import threading
+import csv
+from datetime import datetime
+import os
+from pathlib import Path
+from P6000PowerSupply import P6000PowerSupply
+
+# Global variable for user-specified save directory (session only)
+_user_save_directory = None
+
+def get_default_save_directory():
+    """
+    Get a default save directory that works across different computers.
+    Priority: User-specified > Desktop > Documents > Current Directory > Temp
+    """
+    global _user_save_directory
+    if _user_save_directory and os.path.exists(_user_save_directory) and os.access(_user_save_directory, os.W_OK):
+        return _user_save_directory
+        
+    try:
+        # Try Desktop first (most user-friendly)
+        if os.name == 'nt':  # Windows
+            desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        else:  # Linux/Mac
+            desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        
+        if os.path.exists(desktop) and os.access(desktop, os.W_OK):
+            return desktop
+            
+        # Try Documents folder
+        documents = os.path.join(os.path.expanduser('~'), 'Documents')
+        if os.path.exists(documents) and os.access(documents, os.W_OK):
+            return documents
+            
+        # Try user home directory
+        home = os.path.expanduser('~')
+        if os.access(home, os.W_OK):
+            return home
+            
+        # Fall back to current directory
+        current_dir = os.getcwd()
+        if os.access(current_dir, os.W_OK):
+            return current_dir
+            
+        # Last resort - temp directory
+        import tempfile
+        return tempfile.gettempdir()
+        
+    except Exception:
+        # Absolute fallback
+        return os.getcwd()
+
+def prompt_for_file_location(default_name: str = None) -> str:
+    """
+    Prompt user for file save location with smart defaults.
+    Works in both interactive and .exe environments.
+    """
+    if default_name is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"p6000_log_{timestamp}.csv"
+    
+    default_dir = get_default_save_directory()
+    default_path = os.path.join(default_dir, default_name)
+    
+    print(f"\n=== File Save Location ===")
+    print(f"Default location: {default_path}")
+    print("Options:")
+    print("  1. Use default location (press Enter)")
+    print("  2. Enter custom filename only (saves to default directory)")
+    print("  3. Enter full path (C:\\Users\\...\\filename.csv)")
+    print("  4. Browse directories interactively")
+    
+    try:
+        choice = input("\nEnter choice (1-4) or press Enter for default: ").strip()
+        
+        if not choice or choice == '1':
+            return default_path
+            
+        elif choice == '2':
+            filename = input(f"Enter filename (default: {default_name}): ").strip()
+            if not filename:
+                filename = default_name
+            if not filename.lower().endswith('.csv'):
+                filename += '.csv'
+            return os.path.join(default_dir, filename)
+            
+        elif choice == '3':
+            full_path = input("Enter full path: ").strip()
+            if not full_path:
+                return default_path
+            if not full_path.lower().endswith('.csv'):
+                full_path += '.csv'
+            # Ensure directory exists
+            dir_path = os.path.dirname(full_path)
+            if dir_path and not os.path.exists(dir_path):
+                try:
+                    os.makedirs(dir_path, exist_ok=True)
+                    print(f"Created directory: {dir_path}")
+                except Exception as e:
+                    print(f"Cannot create directory {dir_path}: {e}")
+                    print(f"Using default: {default_path}")
+                    return default_path
+            return full_path
+            
+        elif choice == '4':
+            return browse_for_directory(default_name)
+            
+        else:
+            print("Invalid choice, using default")
+            return default_path
+            
+    except (KeyboardInterrupt, EOFError):
+        print(f"\nUsing default: {default_path}")
+        return default_path
+
+def browse_for_directory(default_name: str) -> str:
+    """
+    Interactive directory browser that works without GUI.
+    """
+    current_dir = get_default_save_directory()
+    
+    print(f"\n=== Directory Browser ===")
+    print("Commands: 'ls' (list), 'cd <dir>' (change), 'up' (parent), 'here' (select current), 'quit' (cancel)")
+    
+    while True:
+        try:
+            print(f"\nCurrent directory: {current_dir}")
+            
+            # List contents
+            try:
+                items = []
+                for item in sorted(os.listdir(current_dir)):
+                    if os.path.isdir(os.path.join(current_dir, item)):
+                        items.append(f"[DIR]  {item}")
+                    else:
+                        items.append(f"[FILE] {item}")
+                
+                print("Contents:")
+                for i, item in enumerate(items[:20]):  # Show max 20 items
+                    print(f"  {item}")
+                if len(items) > 20:
+                    print(f"  ... and {len(items) - 20} more items")
+                    
+            except PermissionError:
+                print("  [Permission Denied]")
+            
+            command = input("\nBrowser> ").strip().lower()
+            
+            if command == 'ls':
+                continue
+            elif command == 'up':
+                current_dir = os.path.dirname(current_dir)
+            elif command.startswith('cd '):
+                target = command[3:].strip()
+                new_dir = os.path.join(current_dir, target)
+                if os.path.isdir(new_dir):
+                    current_dir = os.path.abspath(new_dir)
+                else:
+                    print(f"Directory '{target}' not found")
+            elif command == 'here':
+                final_path = os.path.join(current_dir, default_name)
+                print(f"Selected: {final_path}")
+                return final_path
+            elif command == 'quit':
+                default_path = os.path.join(get_default_save_directory(), default_name)
+                print(f"Cancelled, using default: {default_path}")
+                return default_path
+            else:
+                print("Unknown command. Use: ls, cd <dir>, up, here, quit")
+                
+        except (KeyboardInterrupt, EOFError):
+            default_path = os.path.join(get_default_save_directory(), default_name)
+            print(f"\nCancelled, using default: {default_path}")
+            return default_path
+
+class P6000DataLogger:
+    """Data logger for P6000 power supply measurements - similar to TSI pattern."""
+    
+    def __init__(self, psu):
+        self.psu = psu
+        
+    def collect_data(self, duration: int, sample_rate: float = 1.0, filename: str = None, interactive: bool = True) -> bool:
+        """
+        Collect data for specified duration (blocking operation like TSI script).
+        
+        @param duration: Collection duration in seconds
+        @param sample_rate: Sample rate in seconds
+        @param filename: Output filename (if None and interactive=True, prompts user)
+        @param interactive: Whether to prompt user for file location
+        @return: True if successful
+        """
+        if not self.psu or not self.psu.is_connected:
+            print("P6000 not connected. Connect first.")
+            return False
+            
+        # Handle filename selection
+        if filename is None:
+            if interactive:
+                filename = prompt_for_file_location()
+            else:
+                # Auto-generate filename with safe default location
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                default_name = f"p6000_log_{timestamp}.csv"
+                filename = os.path.join(get_default_save_directory(), default_name)
+        else:
+            # Ensure absolute path for provided filename
+            if not os.path.isabs(filename):
+                filename = os.path.join(get_default_save_directory(), filename)
+            
+        # Ensure .csv extension
+        if not filename.lower().endswith('.csv'):
+            filename += '.csv'
+            
+        # Ensure directory exists
+        dir_path = os.path.dirname(filename)
+        if dir_path and not os.path.exists(dir_path):
+            try:
+                os.makedirs(dir_path, exist_ok=True)
+                print(f"Created directory: {dir_path}")
+            except Exception as e:
+                print(f"Error creating directory {dir_path}: {e}")
+                # Fall back to default directory
+                default_dir = get_default_save_directory()
+                filename = os.path.join(default_dir, os.path.basename(filename))
+                print(f"Using fallback location: {filename}")
+            
+        try:
+            print(f"Starting data collection for {duration} seconds...")
+            print(f"Sample rate: {sample_rate} seconds")
+            print(f"Output file: {filename}")
+            print(f"Full path: {os.path.abspath(filename)}")
+            
+            with open(filename, 'w', newline='', encoding='utf-8') as csv_file:
+                import csv
+                csv_writer = csv.writer(csv_file)
+                
+                # Write CSV headers
+                headers = [
+                    'Sample_Number',
+                    'Elapsed_Time_sec', 
+                    'Timestamp',
+                    'Voltage_Live_V',        # Live voltage (SET voltage when manually controlled)
+                    'Current_Live_A',        # Live current (0A with no load)
+                    'Power_Live_W',          # Live power consumption
+                    'I_Set_Max_A',           # Current limit setting (max allowed)
+                    'V_Max_Set_V',           # Maximum voltage setting  
+                    'P_Max_Set_W',           # Maximum power setting
+                    'Over_Voltage',
+                    'Over_Current',
+                    'Over_Power'
+                ]
+                csv_writer.writerow(headers)
+                
+                start_time = time.time()
+                last_output = start_time
+                sample_count = 0
+                next_sample_time = start_time
+                
+                print(f"Collecting data for {duration} seconds...")
+                
+                while True:
+                    current_time = time.time()
+                    elapsed = current_time - start_time
+                    
+                    # Print progress indicator every 10 seconds
+                    if (current_time - last_output) > 10:
+                        print("*", end="", flush=True)
+                        last_output = current_time
+                    
+                    # Stop after duration
+                    if elapsed > duration:
+                        break
+                    
+                    # Check if it's time for next sample
+                    if current_time >= next_sample_time:
+                        # Get data from P6000
+                        measurements = self.psu.read_measurements()
+                        
+                        if measurements:
+                            sample_count += 1
+                            timestamp = datetime.fromtimestamp(current_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                            
+                            # Write data row with correct live vs set values
+                            row = [
+                                sample_count,
+                                f"{elapsed:.3f}",
+                                timestamp,
+                                f"{measurements.get('voltage_mv', 0) / 1000.0:.3f}",            # Live voltage (SET voltage = knob setting)
+                                f"{measurements.get('actual_current_ma', 0) / 1000.0:.3f}",     # Live current (0A with no load)
+                                f"{measurements.get('actual_power_w', 0):.3f}",                 # Live power
+                                f"{measurements.get('max_current_ma', 0) / 1000.0:.3f}",        # I_Set (current limit)
+                                f"{measurements.get('max_voltage_mv', 0) / 1000.0:.3f}",        # V_Max (voltage limit)
+                                f"{measurements.get('max_power_w', 0):.3f}",                    # P_Max (power limit)
+                                "YES" if measurements.get('over_voltage', False) else "NO",     # Over voltage 
+                                "YES" if measurements.get('over_current', False) else "NO",
+                                "YES" if measurements.get('over_power', False) else "NO"
+                            ]
+                            
+                            csv_writer.writerow(row)
+                            csv_file.flush()  # Ensure data is written to disk
+                        
+                        # Schedule next sample
+                        next_sample_time += sample_rate
+                    else:
+                        # Sleep briefly to avoid busy waiting
+                        time.sleep(0.1)
+                
+                print()  # New line after progress indicators
+                print(f"Data collection completed!")
+                print(f"Collected {sample_count} samples over {elapsed:.1f} seconds")
+                print(f"Data saved to: {filename}")
+                
+            return True
+            
+        except KeyboardInterrupt:
+            print("\nData collection interrupted by user.")
+            return False
+        except Exception as e:
+            print(f"Failed to collect data: {e}")
+            return False
+
+def print_help():
+    """Print available commands."""
+    cmds = [
+        ("help", "0", "Show this help message"),
+        ("open <port> <baud> <addr>", "1", "Open serial port (e.g., open COM1 9600 0)"),
+        ("set <volts> <amps>", "2", "Set voltage and current (e.g., set 12.5 0.5)"),
+        ("voltage <mV>", "3", "Set voltage in millivolts (e.g., voltage 12000)"),
+        ("current <mA>", "4", "Set current in milliamperes (e.g., current 1000)"),
+        ("on", "5", "Turn output ON"),
+        ("off", "6", "Turn output OFF"),
+        ("read", "7", "Read current measurements"),
+        ("readings", "7b", "Read current measurements (alias)"),
+        ("status", "8", "Show device status"),
+        ("local", "9", "Switch to Local control (enable front panel buttons)"),
+        ("collect <duration> [rate] [file]", "10", "Collect data for specified duration"),
+        ("close", "11", "Close the serial port"),
+        ("quit", "12", "Exit this CLI"),
+        ("maxvoltage <mV>", "13", "Set max voltage limit (Menu->Max Voltage, e.g., maxvoltage 24000)"),
+        ("maxpower <watts>", "14", "Set max power limit (Menu->Max Power, e.g., maxpower 72.0)"),
+        ("saveto", "15", "Set default save directory for this session"),
+        ("showpath", "16", "Show current save directory and test file path")
+    ]
+    print("Available commands:")
+    for cmd, num, desc in cmds:
+        print(f"  {num:>2}. {cmd:<30} {desc}")
+    print("\nData Collection Examples:")
+    print("  collect 60                  # 60 seconds, choose save location interactively")
+    print("  collect 30 0.5              # 30 seconds at 500ms intervals, choose location")
+    print("  collect 120 2 test_data     # 120 seconds at 2 sec intervals to test_data.csv")
+    print("  collect 60 1 auto           # 60 seconds with auto-generated filename")
+    print("\nMax Limits Examples:")
+    print("  maxvoltage 24000            # Set max voltage to 24V (Menu setting)")
+    print("  maxpower 72.0               # Set max power to 72W (Menu setting)")
+    print("\nFile Management:")
+    print("  saveto                      # Set default save directory")
+    print("  showpath                    # Show current save directory")
+    print("\nCross-Platform Compatibility:")
+    print("  - Files save to Desktop/Documents/Home folder automatically")
+    print("  - Works when converted to .exe and run from USB drive")
+    print("  - User can choose custom save locations interactively")
+
+def main():
+    print("P6000 Protek Power Supply CLI with Data Logging. Type 'help' or '0' for a list of commands.")
+    
+    psu = None
+    logger = None
+    
+    while True:
+        try:
+            line = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+            
+        if not line:
+            continue
+            
+        parts = line.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        # Handle numeric commands
+        if cmd.isdigit():
+            cmd_map = {
+                '0': 'help', '1': 'open', '2': 'set', '3': 'voltage', '4': 'current',
+                '5': 'on', '6': 'off', '7': 'read', '8': 'status', '9': 'local',
+                '10': 'collect', '11': 'close', '12': 'quit', '13': 'maxvoltage', '14': 'maxpower',
+                '15': 'saveto', '16': 'showpath'
+            }
+            cmd = cmd_map.get(cmd, cmd)
+
+        if cmd in ('quit', 'exit'):
+            break
+            
+        elif cmd == 'help':
+            print_help()
+
+        elif cmd == 'open':
+            if len(args) < 1:
+                print("Usage: open <port> [baud] [address]")
+                print("  port: COM1, COM2, etc.")
+                print("  baud: 4800, 9600, 19200, 38400 (default: 9600)")
+                print("  address: 0-31 (default: 0)")
+                continue
+                
+            port = args[0]
+            baudrate = int(args[1]) if len(args) > 1 else 9600
+            address = int(args[2]) if len(args) > 2 else 0
+            
+            if baudrate not in [4800, 9600, 19200, 38400]:
+                print("Error: Invalid baud rate. Use 4800, 9600, 19200, or 38400")
+                continue
+                
+            if not (0 <= address <= 31):
+                print("Error: Address must be 0-31")
+                continue
+            
+            try:
+                if psu:
+                    psu.disconnect()
+                    
+                psu = P6000PowerSupply()
+                if psu.connect(port, baudrate, address):
+                    print(f"Connected to P6000 on {port} at {baudrate} baud, address {address}")
+                    # Initialize data logger
+                    logger = P6000DataLogger(psu)
+                else:
+                    print(f"Failed to connect to {port}")
+                    psu = None
+            except Exception as e:
+                print(f"Connection error: {e}")
+                psu = None
+
+        elif cmd == 'close':
+            if psu:
+                psu.disconnect()
+                print("Connection closed")
+                psu = None
+                logger = None
+            else:
+                print("No connection to close")
+
+        elif cmd == 'set':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            if len(parts) != 3:
+                print("Usage: set <voltage> <current>")
+                print("Example: set 12.5 0.5")
+                continue
+                
+            try:
+                voltage = float(parts[1])
+                current = float(parts[2])
+                
+                if not (0 <= voltage <= 36):
+                    print("Error: Voltage must be between 0 and 36V")
+                    continue
+                    
+                if not (0 <= current <= 3):
+                    print("Error: Current must be between 0 and 3A")
+                    continue
+                
+                voltage_mv = int(voltage * 1000)
+                current_ma = int(current * 1000)
+                
+                if psu.set_voltage_and_current(voltage_mv, current_ma):
+                    print(f"Set voltage to {voltage}V, current limit to {current}A")
+                else:
+                    print("Failed to set voltage and current")
+            except ValueError:
+                print("Error: Voltage and current must be numbers")
+
+        elif cmd == 'voltage':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            if len(args) != 1:
+                print("Usage: voltage <millivolts>")
+                print("  Example: voltage 12000  (for 12.0V)")
+                print("  Range: 0-36000 mV")
+                continue
+                
+            try:
+                voltage_mv = int(args[0])
+                if not (0 <= voltage_mv <= 36000):
+                    print("Error: Voltage must be 0-36000 mV")
+                    continue
+                    
+                # Get current setting to preserve it (max_current_ma IS the current setting)
+                measurements = psu.read_measurements()
+                # Use max_current_ma which is the current setting according to datasheet
+                current_ma = measurements.get('max_current_ma', 1000) if measurements else 1000
+                
+                print(f"DEBUG: Setting voltage to {voltage_mv}mV, preserving current setting {current_ma}mA")
+                
+                if psu.set_voltage_and_current(voltage_mv, current_ma):
+                    print(f"Voltage set to {voltage_mv} mV ({voltage_mv/1000:.3f} V)")
+                else:
+                    print("Failed to set voltage")
+            except ValueError:
+                print("Error: Voltage must be a number")
+
+        elif cmd == 'current':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            if len(args) != 1:
+                print("Usage: current <milliamps>")
+                print("  Example: current 1500  (for 1.5A)")
+                print("  Range: 0-3000 mA")
+                continue
+                
+            try:
+                current_ma = int(args[0])
+                if not (0 <= current_ma <= 3000):
+                    print("Error: Current must be 0-3000 mA")
+                    continue
+                    
+                # Get current voltage setting to preserve it (not actual voltage reading)
+                measurements = psu.read_measurements()
+                # Use voltage_mv which is the voltage setting, not actual voltage reading
+                voltage_mv = measurements.get('voltage_mv', 12000) if measurements else 12000
+                
+                print(f"DEBUG: Setting current to {current_ma}mA, preserving voltage setting {voltage_mv}mV")
+                
+                if psu.set_voltage_and_current(voltage_mv, current_ma):
+                    print(f"Current set to {current_ma} mA ({current_ma/1000:.3f} A)")
+                else:
+                    print("Failed to set current")
+            except ValueError:
+                print("Error: Current must be a number")
+
+        elif cmd == 'on':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            if psu.set_output_state(True):
+                print("Output ON")
+            else:
+                print("Failed to turn output ON")
+
+        elif cmd == 'off':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            if psu.set_output_state(False):
+                print("Output OFF")
+            else:
+                print("Failed to turn output OFF")
+
+        elif cmd == 'read' or cmd == 'readings':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            measurements = psu.read_measurements()
+            if measurements:
+                print(f"Voltage: {measurements['voltage_v']:.3f} V ({measurements['voltage_mv']} mV)")
+                print(f"Current: {measurements['current_a']:.3f} A ({measurements['current_ma']} mA)")
+                print(f"Power:   {measurements['power']:.2f} W")
+                print(f"Output:  {'ON' if measurements['output_on'] else 'OFF'}")
+                if measurements['over_current']:
+                    print("WARNING: Over-current condition")
+                if measurements['over_power']:
+                    print("WARNING: Over-power condition")
+            else:
+                print("Failed to read measurements")
+
+        elif cmd == 'status':
+            if psu and psu.is_connected:
+                measurements = psu.read_measurements()
+                if measurements:
+                    print("P6000 Status:")
+                    print(f"  Connection: Connected")
+                    print(f"  Control:    {'PC' if measurements['pc_control'] else 'Local'}")
+                    print(f"  Output:     {'ON' if measurements['output_on'] else 'OFF'}")
+                    print(f"  Voltage:    {measurements['voltage_v']:.3f} V")
+                    print(f"  Current:    {measurements['current_a']:.3f} A")
+                    print(f"  Power:      {measurements['power']:.2f} W")
+                else:
+                    print("Connected but cannot read status")
+            else:
+                print("Not connected")
+
+        elif cmd == 'local':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            print("Switching to Local control mode...")
+            print("This will enable front panel buttons on the P6000")
+            print("The LCD 'PC' indicator should disappear")
+            
+            if psu.enable_local_control():
+                print("    Local control enabled")
+                print("You can now use the front panel buttons")
+                print("To return to PC control, use any voltage/current command")
+            else:
+                print("    Failed to enable local control")
+
+        elif cmd == 'collect':
+            if not logger:
+                print("Connect to P6000 first")
+                continue
+                
+            if len(args) == 0:
+                print("Usage: collect <duration> [sample_rate] [filename]")
+                print("Examples:")
+                print("  collect 60                   # Collect for 60 seconds, choose save location interactively")
+                print("  collect 30 0.5               # 30 seconds at 500ms intervals, choose location") 
+                print("  collect 120 2 test_data      # 120 seconds at 2 sec intervals, save as 'test_data.csv'")
+                print("  collect 60 1 auto           # Use auto-generated filename in default location")
+                continue
+                
+            try:
+                duration = int(args[0])
+                if duration <= 0:
+                    print("Error: Duration must be positive")
+                    continue
+            except ValueError:
+                print("Error: Duration must be a number")
+                continue
+                
+            sample_rate = 1.0  # Default 1 second
+            filename = None
+            interactive = True
+            
+            # Parse optional arguments
+            if len(args) > 1:
+                try:
+                    sample_rate = float(args[1])
+                    if sample_rate <= 0:
+                        print("Error: Sample rate must be positive")
+                        continue
+                except ValueError:
+                    # Second arg might be filename, not sample rate
+                    filename = args[1]
+                    if filename.lower() == 'auto':
+                        filename = None
+                        interactive = False
+                    
+            if len(args) > 2:
+                filename = args[2]
+                if filename.lower() == 'auto':
+                    filename = None
+                    interactive = False
+                
+            # Start data collection (blocking operation)
+            logger.collect_data(duration, sample_rate, filename, interactive)
+
+        elif cmd == 'saveto':
+            # Quick command to set default save directory
+            print("\n=== Set Default Save Directory ===")
+            current_default = get_default_save_directory()
+            print(f"Current default: {current_default}")
+            
+            try:
+                new_path = input("Enter new default directory (or press Enter to keep current): ").strip()
+                if new_path and os.path.isdir(new_path) and os.access(new_path, os.W_OK):
+                    # For this session, we'll store it in a global variable
+                    global _user_save_directory
+                    _user_save_directory = new_path
+                    print(f"Default save directory set to: {new_path}")
+                    print("(This setting is for current session only)")
+                elif new_path:
+                    print("Invalid directory or no write permission")
+            except (KeyboardInterrupt, EOFError):
+                print("Cancelled")
+
+        elif cmd == 'showpath':
+            # Show current save directory and test file
+            default_dir = get_default_save_directory()
+            print(f"\nDefault save directory: {default_dir}")
+            print(f"Directory exists: {os.path.exists(default_dir)}")
+            print(f"Write permission: {os.access(default_dir, os.W_OK)}")
+            
+            # Show what a test filename would be
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            test_file = os.path.join(default_dir, f"p6000_log_{timestamp}.csv")
+            print(f"Example filename: {test_file}")
+
+        elif cmd == 'maxvoltage':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            if len(args) != 1:
+                print("Usage: maxvoltage <millivolts>")
+                print("  Example: maxvoltage 24000  (for 24.0V max)")
+                print("  Range: 0-36000 mV")
+                print("  Note: This sets the max voltage limit (Menu->Max Voltage)")
+                continue
+                
+            try:
+                max_voltage_mv = int(args[0])
+                if not (0 <= max_voltage_mv <= 36000):
+                    print("Error: Max voltage must be 0-36000 mV")
+                    continue
+                    
+                if psu.set_max_voltage(max_voltage_mv):
+                    print(f"Max voltage limit set to {max_voltage_mv} mV ({max_voltage_mv/1000:.3f} V)")
+                    print("This is now the maximum voltage that can be set")
+                else:
+                    print("Failed to set max voltage limit")
+            except ValueError:
+                print("Error: Max voltage must be a number")
+
+        elif cmd == 'maxpower':
+            if not psu or not psu.is_connected:
+                print("Not connected. Use 'open' first")
+                continue
+                
+            if len(args) != 1:
+                print("Usage: maxpower <watts>")
+                print("  Example: maxpower 72.0  (for 72W max)")
+                print("  Range: 0-108.0 W")
+                print("  Note: This sets the max power limit (Menu->Max Power)")
+                continue
+                
+            try:
+                max_power_w = float(args[0])
+                if not (0 <= max_power_w <= 108.0):
+                    print("Error: Max power must be 0-108.0 W")
+                    continue
+                    
+                if psu.set_max_power(max_power_w):
+                    print(f"Max power limit set to {max_power_w:.2f} W")
+                    print("This is now the maximum power that can be delivered")
+                else:
+                    print("Failed to set max power limit")
+            except ValueError:
+                print("Error: Max power must be a number")
+
+        else:
+            print(f"Unknown command: {cmd}")
+            print("Type 'help' for available commands")
+
+    # Cleanup
+    if psu:
+        psu.disconnect()
+        print("Connection closed")
+    
+    print("Goodbye!")
+
+if __name__ == '__main__':
+    main()

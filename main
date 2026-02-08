@@ -1,0 +1,1292 @@
+#!/usr/bin/env python3
+"""
+P6000 Programmable Power Supply Controller
+Equivalent to powerSupplyHans.rb functionality.
+
+Controls P6000 series programmable power supplies via serial communication.
+Provides voltage/current setting, monitoring, and data logging capabilities.
+
+Author: Generated for CPAP Testing Automation
+Version: 1.0
+Date: July 2025
+"""
+
+import serial
+import time
+import logging
+from typing import Optional, Tuple, Dict
+import threading
+import csv
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class P6000PowerSupply:
+    """
+    P6000 Programmable Power Supply Controller.
+    
+    Communicates with P6000 power supplies at 9600 baud
+    for voltage/current control and monitoring.
+    """
+    
+    def __init__(self):
+        """
+        Initialize power supply controller.
+        
+        No parameters needed - connection details provided in connect() method.
+        """
+        self.port = None
+        self.baudrate = None
+        self.device_address = None
+        self.serial_conn = None
+        self.is_connected = False
+        self.monitoring = False
+        self.monitor_thread = None
+        self.data_log = []
+        
+    def connect(self, port: str, baudrate: int = 9600, address: int = 0) -> bool:
+        """
+        Connect to the power supply.
+        
+        @param port: Serial port (e.g., 'COM1')
+        @param baudrate: Communication speed (4800, 9600, 19200, 38400)
+        @param address: Device address (0-31, typically 0)
+        @return: True if connection successful
+        """
+        self.port = port
+        self.baudrate = baudrate
+        self.device_address = address
+        
+        try:
+            self.serial_conn = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=3.0,  # Longer timeout for Protek P6000
+                rtscts=False,
+                dsrdtr=False
+            )
+            
+            # Set DTR and RTS high as required by P6000 manual
+            self.serial_conn.setDTR(True)
+            self.serial_conn.setRTS(True)
+            
+            # Clear any existing data
+            self.serial_conn.flushInput()
+            self.serial_conn.flushOutput()
+            time.sleep(1)  # Allow connection to stabilize
+            
+            print(f"DEBUG: Attempting to communicate with P6000 on {port} at {baudrate} baud...")
+            print("DEBUG: Using P6000 binary protocol (26-byte packets)")
+            
+            # Test communication using P6000 binary protocol
+            # Send command 81H (read measurements) to test connection
+            if self._test_binary_communication():
+                self.is_connected = True
+                print("SUCCESS: Connected using P6000 binary protocol")
+                
+                # Initialize PC control mode using Command 82H
+                if self._enable_pc_control():
+                    print("SUCCESS: PC control mode enabled")
+                else:
+                    print("WARNING: Failed to enable PC control mode")
+                
+                return True
+            else:
+                print("DEBUG: No response to P6000 binary protocol")
+                logger.error("Failed to communicate with Protek P6000")
+                self.disconnect()
+                return False
+                
+        except Exception as e:
+            logger.error(f"Connection failed: {e}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from power supply"""
+        self.stop_monitoring()
+        
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+        
+        self.is_connected = False
+        logger.info("Disconnected from power supply")
+    
+    def _send_binary_command(self, command: int, data: list = None) -> Optional[list]:
+        """
+        Send P6000 binary command using 26-byte protocol from manual.
+        
+        @param command: Command byte (80H=set, 81H=read, 82H=control)
+        @param data: Data bytes (optional, max 22 bytes)
+        @return: Response data list or None
+        """
+        print(f"DEBUG: _send_binary_command called with command 0x{command:02X}")
+        
+        if not self.serial_conn:
+            print("DEBUG: No serial connection available")
+            return None
+        
+        if not self.serial_conn.is_open:
+            print("DEBUG: Serial port is not open")
+            return None
+        
+        try:
+            # Build 26-byte command packet per P6000 manual
+            packet = [0xAA]  # Header byte
+            packet.append(self.device_address)  # Address (0-31)
+            packet.append(command)  # Command byte
+            
+            # Add data bytes (positions 3-24) or fill with zeros
+            if data:
+                packet.extend(data[:22])  # Max 22 data bytes
+            
+            # Pad to 25 bytes total (header + address + command + 22 data)
+            while len(packet) < 25:
+                packet.append(0)
+            
+            # Calculate checksum (sum of bytes 0-24, take low byte)
+            checksum = sum(packet) & 0xFF
+            packet.append(checksum)
+            
+            print(f"DEBUG: Sending P6000 command {command:02X}H: {[hex(b) for b in packet]}")
+            print(f"DEBUG: Raw packet bytes: {packet}")
+            
+            # Send 26-byte packet
+            self.serial_conn.write(bytes(packet))
+            self.serial_conn.flush()
+            print(f"DEBUG: Sent {len(packet)} bytes to serial port")
+            
+            # Wait a bit for response
+            time.sleep(0.2)
+            bytes_waiting = self.serial_conn.in_waiting
+            print(f"DEBUG: {bytes_waiting} bytes waiting in buffer")
+            
+            # Read 26-byte response
+            response = self.serial_conn.read(26)
+            print(f"DEBUG: Read {len(response)} bytes from serial")
+            
+            if len(response) == 26:
+                response_list = list(response)
+                print(f"DEBUG: Received response: {[hex(b) for b in response_list]}")
+                
+                # Verify response checksum
+                calc_checksum = sum(response_list[:25]) & 0xFF
+                if calc_checksum == response_list[25]:
+                    print("DEBUG: Checksum valid")
+                    return response_list
+                else:
+                    print(f"DEBUG: Checksum mismatch - calc: {calc_checksum:02X}, recv: {response_list[25]:02X}")
+            elif len(response) > 0:
+                print(f"DEBUG: Partial response: {[hex(b) for b in response]}")
+            else:
+                print(f"DEBUG: No response received")
+            
+            return None
+            
+        except Exception as e:
+            print(f"DEBUG: Binary command error: {e}")
+            return None
+    
+    def _test_binary_communication(self) -> bool:
+        """Test P6000 binary communication with read command."""
+        print("DEBUG: Testing binary communication with P6000...")
+        # Send command 81H (read measurements) with no data
+        response = self._send_binary_command(0x81, [0] * 22)
+        success = response is not None
+        print(f"DEBUG: Binary communication test {'PASSED' if success else 'FAILED'}")
+        return success
+    
+    def _enable_pc_control(self) -> bool:
+        """
+        Enable PC control mode using Command 82H.
+        Sets PC control mode but keeps power output OFF by default.
+        This allows PC control while maintaining manual control capability.
+        """
+        print("DEBUG: Enabling PC control mode with output OFF (default safe state)...")
+        
+        # Command 82H - Set P6000 Power Supply Mode
+        command = [0] * 26
+        command[0] = 0xAA  # Header (AAH)
+        command[1] = self.device_address  # Address (0-31)
+        command[2] = 0x82  # Command (82H)
+        # FIXED: Bit 1=1 (PC Control), Bit 0=0 (Power OFF by default)
+        command[3] = 0x02  # PC control enabled, but output OFF
+        # Bytes 4-24 are 0
+        command[25] = sum(command[:25]) & 0xFF  # Checksum
+        
+        try:
+            if not self.serial_conn or not self.serial_conn.is_open:
+                print("DEBUG: No serial connection for PC control")
+                return False
+            
+            # Send command
+            self.serial_conn.write(bytes(command))
+            self.serial_conn.flush()
+            
+            # Read response
+            time.sleep(0.1)
+            response = self.serial_conn.read(26)
+            
+            if len(response) == 26:
+                print("DEBUG: PC control mode enabled successfully (output OFF by default)")
+                return True
+            else:
+                print(f"DEBUG: PC control failed - got {len(response)} bytes")
+                return False
+                
+        except Exception as e:
+            print(f"DEBUG: PC control error: {e}")
+            return False
+    
+    def enable_local_control(self) -> bool:
+        """
+        Switch P6000 back to Local control mode to enable manual front panel operation.
+        This allows you to use the front panel buttons while keeping the PC connection.
+        """
+        print("DEBUG: Switching to Local control mode (enables front panel buttons)...")
+        
+        # Command 82H - Set P6000 Power Supply Mode  
+        command = [0] * 26
+        command[0] = 0xAA  # Header (AAH)
+        command[1] = self.device_address  # Address (0-31)
+        command[2] = 0x82  # Command (82H)
+        # Bit 1=0 (Local Control), Bit 0=0 (Power OFF)
+        command[3] = 0x00  # Local control mode, output OFF
+        # Bytes 4-24 are 0
+        command[25] = sum(command[:25]) & 0xFF  # Checksum
+        
+        try:
+            if not self.serial_conn or not self.serial_conn.is_open:
+                print("DEBUG: No serial connection for local control")
+                return False
+            
+            # Send command
+            self.serial_conn.write(bytes(command))
+            self.serial_conn.flush()
+            
+            # Read response
+            time.sleep(0.1)
+            response = self.serial_conn.read(26)
+            
+            if len(response) == 26:
+                print("DEBUG: Local control mode enabled - front panel buttons now work")
+                print("INFO: P6000 LCD should no longer show 'PC' indicator")
+                return True
+            else:
+                print(f"DEBUG: Local control failed - got {len(response)} bytes")
+                return False
+                
+        except Exception as e:
+            print(f"DEBUG: Local control error: {e}")
+            return False
+    
+    def ensure_pc_control(self) -> bool:
+        """
+        Ensure PC control mode is enabled for setting voltage/current.
+        This automatically switches from Local to PC mode when needed.
+        """
+        # Check current control mode
+        measurements = self.read_measurements()
+        if measurements and measurements.get('pc_control', False):
+            # Already in PC control mode
+            return True
+        
+        print("DEBUG: Switching to PC control mode for voltage/current setting...")
+        
+        # Switch to PC control mode (output OFF by default)
+        command = [0] * 26
+        command[0] = 0xAA  # Header (AAH)
+        command[1] = self.device_address  # Address (0-31)
+        command[2] = 0x82  # Command (82H)
+        command[3] = 0x02  # PC control enabled, output OFF
+        command[25] = sum(command[:25]) & 0xFF  # Checksum
+        
+        try:
+            if not self.serial_conn or not self.serial_conn.is_open:
+                return False
+            
+            self.serial_conn.write(bytes(command))
+            self.serial_conn.flush()
+            time.sleep(0.1)
+            response = self.serial_conn.read(26)
+            
+            return len(response) == 26
+            
+        except Exception as e:
+            print(f"DEBUG: PC control switch error: {e}")
+            return False
+
+    def set_max_voltage(self, max_voltage_mv: int) -> bool:
+        """
+        Set maximum voltage limit using P6000 binary command 80H.
+        This sets the max voltage that can be configured (Menu -> Max Voltage).
+        
+        @param max_voltage_mv: Maximum voltage in millivolts (0-36000)
+        @return: True if successful
+        """
+        if not (0 <= max_voltage_mv <= 36000):
+            print(f"DEBUG: Invalid max voltage range - {max_voltage_mv}mV (0-36000)")
+            return False
+        
+        print(f"DEBUG: Setting P6000 max voltage to {max_voltage_mv/1000:.3f}V ({max_voltage_mv}mV)")
+        
+        # Ensure PC control mode
+        self.ensure_pc_control()
+        
+        # Get current settings to preserve other values
+        measurements = self.read_measurements()
+        if measurements:
+            current_voltage_mv = measurements.get('voltage_mv', 12000)
+            current_ma = measurements.get('max_current_ma', 1000)
+            max_power = int(measurements.get('max_power_w', 108) * 100)  # Convert to 0.01W units
+        else:
+            current_voltage_mv = 12000
+            current_ma = 1000
+            max_power = 10800
+        
+        # Build command 80H with new max voltage
+        command = [0] * 26
+        command[0] = 0xAA  # Header (AAH)
+        command[1] = self.device_address  # Address (0-31)
+        command[2] = 0x80  # Command (80H)
+        
+        # Bytes 4-5: Max current (preserve current setting)
+        command[3] = current_ma & 0xFF
+        command[4] = (current_ma >> 8) & 0xFF
+        
+        # Bytes 6-9: Max voltage (NEW VALUE) - 32-bit little endian
+        command[5] = max_voltage_mv & 0xFF
+        command[6] = (max_voltage_mv >> 8) & 0xFF
+        command[7] = (max_voltage_mv >> 16) & 0xFF
+        command[8] = (max_voltage_mv >> 24) & 0xFF
+        
+        # Bytes 10-11: Max power (preserve current setting)
+        command[9] = max_power & 0xFF
+        command[10] = (max_power >> 8) & 0xFF
+        
+        # Bytes 12-15: Voltage setting (preserve current setting)
+        command[11] = current_voltage_mv & 0xFF
+        command[12] = (current_voltage_mv >> 8) & 0xFF
+        command[13] = (current_voltage_mv >> 16) & 0xFF
+        command[14] = (current_voltage_mv >> 24) & 0xFF
+        
+        # Byte 16: New address (keep current)
+        command[15] = self.device_address
+        
+        # Checksum
+        command[25] = sum(command[:25]) & 0xFF
+        
+        return self._send_command_80h(command)
+
+    def set_max_power(self, max_power_w: float) -> bool:
+        """
+        Set maximum power limit using P6000 binary command 80H.
+        This sets the max power that can be configured (Menu -> Max Power).
+        
+        @param max_power_w: Maximum power in watts (0-108.0)
+        @return: True if successful
+        """
+        if not (0 <= max_power_w <= 108.0):
+            print(f"DEBUG: Invalid max power range - {max_power_w}W (0-108.0)")
+            return False
+        
+        max_power_raw = int(max_power_w * 100)  # Convert to 0.01W units
+        print(f"DEBUG: Setting P6000 max power to {max_power_w:.2f}W ({max_power_raw})")
+        
+        # Ensure PC control mode
+        self.ensure_pc_control()
+        
+        # Get current settings to preserve other values
+        measurements = self.read_measurements()
+        if measurements:
+            current_voltage_mv = measurements.get('voltage_mv', 12000)
+            current_ma = measurements.get('max_current_ma', 1000)
+            max_voltage_mv = measurements.get('max_voltage_mv', 36000)
+        else:
+            current_voltage_mv = 12000
+            current_ma = 1000
+            max_voltage_mv = 36000
+        
+        # Build command 80H with new max power
+        command = [0] * 26
+        command[0] = 0xAA  # Header (AAH)
+        command[1] = self.device_address  # Address (0-31)
+        command[2] = 0x80  # Command (80H)
+        
+        # Bytes 4-5: Max current (preserve current setting)
+        command[3] = current_ma & 0xFF
+        command[4] = (current_ma >> 8) & 0xFF
+        
+        # Bytes 6-9: Max voltage (preserve current setting)
+        command[5] = max_voltage_mv & 0xFF
+        command[6] = (max_voltage_mv >> 8) & 0xFF
+        command[7] = (max_voltage_mv >> 16) & 0xFF
+        command[8] = (max_voltage_mv >> 24) & 0xFF
+        
+        # Bytes 10-11: Max power (NEW VALUE)
+        command[9] = max_power_raw & 0xFF
+        command[10] = (max_power_raw >> 8) & 0xFF
+        
+        # Bytes 12-15: Voltage setting (preserve current setting)
+        command[11] = current_voltage_mv & 0xFF
+        command[12] = (current_voltage_mv >> 8) & 0xFF
+        command[13] = (current_voltage_mv >> 16) & 0xFF
+        command[14] = (current_voltage_mv >> 24) & 0xFF
+        
+        # Byte 16: New address (keep current)
+        command[15] = self.device_address
+        
+        # Checksum
+        command[25] = sum(command[:25]) & 0xFF
+        
+        return self._send_command_80h(command)
+
+    def _send_command_80h(self, command: list) -> bool:
+        """
+        Helper method to send a prepared Command 80H and handle response.
+        
+        @param command: 26-byte command list
+        @return: True if successful
+        """
+        try:
+            if not self.serial_conn or not self.serial_conn.is_open:
+                print("DEBUG: No serial connection available")
+                return False
+            
+            # Send command
+            self.serial_conn.write(bytes(command))
+            self.serial_conn.flush()
+            print(f"DEBUG: Sent command 80H: {len(command)} bytes")
+            
+            # Wait and read response
+            time.sleep(0.2)
+            response = self.serial_conn.read(26)
+            print(f"DEBUG: Read {len(response)} bytes from serial")
+            
+            if len(response) == 26:
+                response_list = list(response)
+                print(f"DEBUG: Command 80H successful - response received")
+                return True
+            else:
+                print(f"DEBUG: Command 80H failed - expected 26 bytes, got {len(response)}")
+                return False
+                
+        except Exception as e:
+            print(f"DEBUG: Command 80H error: {e}")
+            return False
+
+    def _send_command(self, command: str) -> Optional[str]:
+        """
+        Legacy ASCII command method - kept for compatibility but not used with P6000.
+        P6000 uses binary protocol only.
+        """
+        print(f"DEBUG: ASCII command '{command}' not supported by P6000 binary protocol")
+        return None
+    
+    def set_voltage(self, voltage: float) -> bool:
+        """
+        Set output voltage using binary protocol.
+        This is a convenience method that calls set_voltage_and_current.
+        
+        @param voltage: Voltage in volts
+        @return: True if successful
+        """
+        if not (0 <= voltage <= 36):  # P6000 range 0-36V
+            logger.error(f"Voltage {voltage}V out of range (0-36V)")
+            return False
+        
+        # Convert to millivolts
+        voltage_mv = int(voltage * 1000)
+        
+        # Get current setting to preserve current limit
+        measurements = self.read_measurements()
+        current_ma = measurements.get('max_current_ma', 1000) if measurements else 1000
+        
+        return self.set_voltage_and_current(voltage_mv, current_ma)
+    
+    def set_current(self, current: float) -> bool:
+        """
+        Set current limit using binary protocol.
+        This is a convenience method that calls set_voltage_and_current.
+        
+        @param current: Current in amperes
+        @return: True if successful
+        """
+        if not (0 <= current <= 3):  # P6000 range 0-3A
+            logger.error(f"Current {current}A out of range (0-3A)")
+            return False
+        
+        # Convert to milliamps
+        current_ma = int(current * 1000)
+        
+        # Get current voltage setting to preserve it
+        measurements = self.read_measurements()
+        voltage_mv = measurements.get('voltage_mv', 12000) if measurements else 12000
+        
+        return self.set_voltage_and_current(voltage_mv, current_ma)
+    
+    def output_on(self) -> bool:
+        """Enable power supply output using binary protocol."""
+        return self.set_output_state(True)
+    
+    def output_off(self) -> bool:
+        """Disable power supply output using binary protocol."""
+        return self.set_output_state(False)
+    
+    def get_voltage(self) -> Optional[float]:
+        """
+        Get actual output voltage using binary protocol.
+        
+        @return: Voltage in volts or None
+        """
+        measurements = self.read_measurements()
+        if measurements and 'actual_voltage_mv' in measurements:
+            return measurements['actual_voltage_mv'] / 1000.0
+        return None
+    
+    def get_current(self) -> Optional[float]:
+        """
+        Get actual output current using binary protocol.
+        
+        @return: Current in amperes or None
+        """
+        measurements = self.read_measurements()
+        if measurements and 'actual_current_ma' in measurements:
+            return measurements['actual_current_ma'] / 1000.0
+        return None
+    
+    def get_power(self) -> Optional[float]:
+        """
+        Get actual output power using binary protocol.
+        
+        @return: Power in watts or None
+        """
+        measurements = self.read_measurements()
+        if measurements and 'actual_power_w' in measurements:
+            return measurements['actual_power_w']
+        return None
+    
+    def set_voltage_and_current(self, voltage_mv: int, current_ma: int) -> bool:
+        """
+        Set voltage and current using P6000 binary command 80H.
+        Based on P6000 datasheet - current setting uses Max Current bytes 4-5.
+        
+        Command 80H byte layout (1-based numbering from manual):
+        Byte 4-5: Max current (low byte, high byte) - THIS IS THE CURRENT SETTING!
+        Byte 6-9: Max voltage (32-bit little endian)
+        Byte 10-11: Max power (low byte, high byte)
+        Byte 12-15: Voltage setting (32-bit little endian) - THE VOLTAGE SETTING
+        Byte 16: New address
+        
+        @param voltage_mv: Voltage in millivolts (0-36000) 
+        @param current_ma: Current in milliamperes (0-3000) - goes to Max Current bytes!
+        @return: True if successful
+        """
+        if not (0 <= voltage_mv <= 36000) or not (0 <= current_ma <= 3000):
+            print(f"DEBUG: Invalid ranges - V:{voltage_mv}mV (0-36000), I:{current_ma}mA (0-3000)")
+            return False
+        
+        # Ensure PC control mode before setting values
+        self.ensure_pc_control()
+        
+        print(f"DEBUG: Setting P6000 voltage to {voltage_mv/1000:.3f}V ({voltage_mv}mV), current to {current_ma/1000:.3f}A ({current_ma}mA)")
+        print(f"DEBUG: Using Max Current bytes 4-5 for current setting as per datasheet")
+        
+        # Build 26-byte command following P6000 datasheet exactly
+        command = [0] * 26
+        command[0] = 0xAA  # Header (AAH)
+        command[1] = self.device_address  # Address (0-31)
+        command[2] = 0x80  # Command (80H)
+        
+        # Set default max values (preserve existing or use defaults)
+        measurements = self.read_measurements()
+        if measurements:
+            max_voltage = measurements.get('max_voltage_mv', 36000)
+            max_power = int(measurements.get('max_power_w', 108) * 100)  # Convert to 0.01W units
+        else:
+            max_voltage = 36000  # 36000mV (36V)
+            max_power = 10800   # 10800 (108.00W)
+        
+        # Bytes 4-5: Max current (low byte, high byte) - THIS IS THE CURRENT SETTING!
+        # According to datasheet: "Issue the 80H command when setting Max Current"
+        command[3] = current_ma & 0xFF
+        command[4] = (current_ma >> 8) & 0xFF
+        
+        # Bytes 6-9: Max voltage (32-bit value, little endian) - preserve existing
+        command[5] = max_voltage & 0xFF
+        command[6] = (max_voltage >> 8) & 0xFF
+        command[7] = (max_voltage >> 16) & 0xFF
+        command[8] = (max_voltage >> 24) & 0xFF
+        
+        # Bytes 10-11: Max power (low byte, high byte) - preserve existing
+        command[9] = max_power & 0xFF
+        command[10] = (max_power >> 8) & 0xFF
+        
+        # Bytes 12-15: Voltage setting (32-bit value, little endian) - THE VOLTAGE SETTING
+        command[11] = voltage_mv & 0xFF
+        command[12] = (voltage_mv >> 8) & 0xFF
+        command[13] = (voltage_mv >> 16) & 0xFF
+        command[14] = (voltage_mv >> 24) & 0xFF
+        
+        # Byte 16: New address (keep current)
+        command[15] = self.device_address
+        
+        # Bytes 17-25: N/A (0) - already initialized to 0
+        
+        # Byte 26: Checksum (sum of bytes 1-25, take low byte)
+        command[25] = sum(command[:25]) & 0xFF
+        
+        print(f"DEBUG: Command packet: {[hex(b) for b in command]}")
+        print(f"DEBUG: Current setting bytes 4-5 (indices 3-4): {[hex(command[i]) for i in range(3,5)]} = {current_ma}mA")
+        print(f"DEBUG: Voltage setting bytes 12-15 (indices 11-14): {[hex(command[i]) for i in range(11,15)]} = {voltage_mv}mV")
+        print(f"DEBUG: Checksum: 0x{command[25]:02X}")
+        
+        # Send command using existing method but with full 26-byte packet
+        try:
+            if not self.serial_conn or not self.serial_conn.is_open:
+                print("DEBUG: No serial connection available")
+                return False
+            
+            # Send 26-byte packet directly
+            self.serial_conn.write(bytes(command))
+            self.serial_conn.flush()
+            print(f"DEBUG: Sent {len(command)} bytes to serial port")
+            
+            # Wait and read response
+            time.sleep(0.2)
+            response = self.serial_conn.read(26)
+            print(f"DEBUG: Read {len(response)} bytes from serial")
+            
+            if len(response) == 26:
+                response_list = list(response)
+                print(f"DEBUG: Response: {[hex(b) for b in response_list[:10]]}...") # Show first 10 bytes
+                
+                # Verify response checksum
+                calc_checksum = sum(response_list[:25]) & 0xFF
+                if calc_checksum == response_list[25]:
+                    print("DEBUG: Response checksum valid")
+                    print(f"DEBUG: Voltage set to {voltage_mv/1000:.3f}V successfully")
+                    return True
+                else:
+                    print(f"DEBUG: Checksum mismatch - calc: {calc_checksum:02X}, recv: {response_list[25]:02X}")
+            elif len(response) > 0:
+                print(f"DEBUG: Partial response: {[hex(b) for b in response]}")
+            else:
+                print(f"DEBUG: No response received")
+            
+            return False
+            
+        except Exception as e:
+            print(f"DEBUG: Command send error: {e}")
+            return False
+    
+    def read_measurements(self) -> Optional[Dict]:
+        """
+        Read current measurements using P6000 binary command 81H.
+        Based on working P6000Collect.py implementation.
+        
+        Command 81H response layout (1-based from manual):
+        Byte 4-5: Current (low byte, high byte)
+        Byte 6-9: Voltage (32-bit little endian)
+        Byte 10-11: Power (low byte, high byte, in 0.01W units)
+        Byte 12-13: Max Current (low byte, high byte) - THIS IS THE CURRENT SETTING!
+        Byte 14-17: Max Voltage (32-bit little endian)
+        Byte 18-19: Max Power (low byte, high byte)
+        Byte 20-23: Voltage Set (32-bit little endian)
+        Byte 24: Power Supply Status
+        
+        @return: Dictionary with voltage_mv, current_ma, power, status
+        """
+        # Build command 81H following working implementation
+        command = [0] * 26
+        command[0] = 0xAA  # Header (AAH)
+        command[1] = self.device_address  # Address (0-31)
+        command[2] = 0x81  # Command (81H)
+        # Bytes 4-25 are 0 for read command
+        command[25] = sum(command[:25]) & 0xFF  # Checksum
+        
+        try:
+            if not self.serial_conn or not self.serial_conn.is_open:
+                print("DEBUG: No serial connection for read")
+                return None
+            
+            # Send command
+            self.serial_conn.write(bytes(command))
+            self.serial_conn.flush()
+            
+            # Read response
+            time.sleep(0.1)
+            response = self.serial_conn.read(26)
+            
+            if len(response) != 26:
+                print(f"DEBUG: Read failed - expected 26 bytes, got {len(response)}")
+                return None
+            
+            response_list = list(response)
+            print(f"DEBUG: Read response received: {len(response)} bytes")
+            
+            # Parse response following working P6000Collect.py exactly
+            # Current value (bytes 4-5, indices 3-4)
+            current_ma = response_list[3] | (response_list[4] << 8)
+            
+            # Voltage value (bytes 6-9, indices 5-8) - 32-bit little endian
+            voltage_mv = (response_list[5] | (response_list[6] << 8) | 
+                         (response_list[7] << 16) | (response_list[8] << 24))
+            
+            # Power value (bytes 10-11, indices 9-10)
+            power_raw = response_list[9] | (response_list[10] << 8)
+            power_w = power_raw / 100.0  # Convert to watts (0.01W units)
+            
+            # Max current (bytes 12-13, indices 11-12) - THIS IS THE CURRENT SETTING!
+            max_current_ma = response_list[11] | (response_list[12] << 8)
+            
+            # Max voltage (bytes 14-17, indices 13-16) - 32-bit little endian
+            max_voltage_mv = (response_list[13] | (response_list[14] << 8) |
+                             (response_list[15] << 16) | (response_list[16] << 24))
+            
+            # Max power (bytes 18-19, indices 17-18)
+            max_power_raw = response_list[17] | (response_list[18] << 8)
+            max_power_w = max_power_raw / 100.0
+            
+            # Voltage setting (bytes 20-23, indices 19-22) - 32-bit little endian
+            voltage_set_mv = (response_list[19] | (response_list[20] << 8) |
+                             (response_list[21] << 16) | (response_list[22] << 24))
+            
+            # Status (byte 24, index 23) - BACK TO ORIGINAL POSITION
+            status = response_list[23]
+            output_on = bool(status & 0x01)      # Bit 0: output state
+            over_current = bool(status & 0x02)   # Bit 1: over current
+            over_power = bool(status & 0x04)     # Bit 2: over power  
+            pc_control = bool(status & 0x08)     # Bit 3: PC control
+            
+            print(f"DEBUG: Parsed - Voltage Set: {voltage_set_mv}mV, Current Set (Max Current): {max_current_ma}mA")
+            print(f"DEBUG: Actual readings - V: {voltage_mv}mV, I: {current_ma}mA, Power: {power_w:.2f}W")
+            print(f"DEBUG: Status: 0x{status:02X} (Output:{output_on}, OC:{over_current}, OP:{over_power}, PC:{pc_control})")
+            
+            # Return data matching the working implementation format
+            return {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                'voltage_mv': voltage_set_mv,        # Voltage setting (what we control)
+                'voltage_v': voltage_set_mv / 1000.0,
+                'current_ma': max_current_ma,        # Current setting (what we control) - Max Current IS the current setting!
+                'current_a': max_current_ma / 1000.0,
+                'power': power_w,                    # Actual power in watts
+                'output_on': output_on,
+                'over_current': over_current,
+                'over_power': over_power,
+                'pc_control': pc_control,
+                # Additional data for compatibility
+                'actual_voltage_mv': voltage_mv,
+                'actual_current_ma': current_ma,
+                'actual_power_w': power_w,
+                'max_voltage_mv': max_voltage_mv,
+                'max_current_ma': max_current_ma,    # Same as current_ma - this IS the current setting
+                'max_power_w': max_power_w,
+                'voltage_set_v': voltage_set_mv / 1000.0,
+                'current_set_v': max_current_ma / 1000.0,  # Current setting in amps (same as max_current)
+                'status_raw': status
+            }
+            
+        except Exception as e:
+            print(f"DEBUG: Error reading measurements: {e}")
+            return None
+    
+    def set_output_state(self, output_on: bool) -> bool:
+        """
+        Set output ON/OFF using P6000 binary command 82H.
+        Based on working P6000Collect.py implementation.
+        
+        Command 82H controls power output and operation mode.
+        Byte 4: Power Supply Mode
+        Bit 0: Power Output Mode (0=OFF, 1=ON)
+        Bit 1: Local/PC Control Mode (0=Local, 1=PC)
+        
+        @param output_on: True for ON, False for OFF
+        @return: True if successful
+        """
+        print(f"DEBUG: Setting P6000 output {'ON' if output_on else 'OFF'} using Command 82H")
+        
+        # Command 82H following working implementation
+        command = [0] * 26
+        command[0] = 0xAA  # Header (AAH)
+        command[1] = self.device_address  # Address (0-31)
+        command[2] = 0x82  # Command (82H)
+        
+        # Build status byte: Bit 1=1 (PC Control), Bit 0 = output state
+        if output_on:
+            command[3] = 0x03  # Bit 0=1 (Power ON), Bit 1=1 (PC Control)
+        else:
+            command[3] = 0x02  # Bit 0=0 (Power OFF), Bit 1=1 (PC Control)
+        
+        # Bytes 4-24 are 0
+        command[25] = sum(command[:25]) & 0xFF  # Checksum
+        
+        print(f"DEBUG: Status byte: 0x{command[3]:02X}")
+        
+        try:
+            if not self.serial_conn or not self.serial_conn.is_open:
+                print("DEBUG: No serial connection for output control")
+                return False
+            
+            # Send command
+            self.serial_conn.write(bytes(command))
+            self.serial_conn.flush()
+            
+            # Read response
+            time.sleep(0.1)
+            response = self.serial_conn.read(26)
+            
+            if len(response) == 26:
+                print(f"DEBUG: Output control {'ON' if output_on else 'OFF'} successful")
+                return True
+            else:
+                print(f"DEBUG: Output control failed - got {len(response)} bytes")
+                return False
+                
+        except Exception as e:
+            print(f"DEBUG: Output control error: {e}")
+            return False
+    
+    def set_ovp(self, voltage: float) -> bool:
+        """
+        Set over-voltage protection.
+        
+        @param voltage: Over-voltage protection level in volts
+        @return: True if successful
+        """
+        if not (0 <= voltage <= 66):  # P6000 OVP range
+            logger.error(f"OVP voltage {voltage}V out of range (0-66V)")
+            return False
+        
+        commands = [f"VOLT:PROT {voltage:.2f}", f"OVP {voltage:.2f}", f"PROT:VOLT {voltage:.2f}"]
+        
+        for command in commands:
+            response = self._send_command(command)
+            if response is not None:
+                logger.info(f"Set over-voltage protection to {voltage}V")
+                return True
+        
+        logger.error(f"Failed to set OVP to {voltage}V")
+        return False
+    
+    def set_ocp(self, current: float) -> bool:
+        """
+        Set over-current protection.
+        
+        @param current: Over-current protection level in amperes
+        @return: True if successful
+        """
+        if not (0 <= current <= 11):  # P6000 OCP range
+            logger.error(f"OCP current {current}A out of range (0-11A)")
+            return False
+        
+        commands = [f"CURR:PROT {current:.3f}", f"OCP {current:.3f}", f"PROT:CURR {current:.3f}"]
+        
+        for command in commands:
+            response = self._send_command(command)
+            if response is not None:
+                logger.info(f"Set over-current protection to {current}A")
+                return True
+        
+        logger.error(f"Failed to set OCP to {current}A")
+        return False
+    
+    def store_preset(self, memory_slot: int, voltage: float, current: float) -> bool:
+        """
+        Store voltage/current settings to memory preset.
+        
+        @param memory_slot: Memory slot (1-9)
+        @param voltage: Voltage to store
+        @param current: Current to store
+        @return: True if successful
+        """
+        if not (1 <= memory_slot <= 9):
+            logger.error(f"Memory slot {memory_slot} out of range (1-9)")
+            return False
+        
+        # Set the values first
+        if not (self.set_voltage(voltage) and self.set_current(current)):
+            logger.error("Failed to set voltage/current before storing")
+            return False
+        
+        # Store to memory
+        commands = [f"*SAV {memory_slot}", f"SAVE {memory_slot}", f"MEM:STOR {memory_slot}"]
+        
+        for command in commands:
+            response = self._send_command(command)
+            if response is not None:
+                logger.info(f"Stored preset {memory_slot}: {voltage}V, {current}A")
+                return True
+        
+        logger.error(f"Failed to store preset {memory_slot}")
+        return False
+    
+    def recall_preset(self, memory_slot: int) -> bool:
+        """
+        Recall voltage/current settings from memory preset.
+        
+        @param memory_slot: Memory slot (1-9)
+        @return: True if successful
+        """
+        if not (1 <= memory_slot <= 9):
+            logger.error(f"Memory slot {memory_slot} out of range (1-9)")
+            return False
+        
+        commands = [f"*RCL {memory_slot}", f"RECALL {memory_slot}", f"MEM:LOAD {memory_slot}"]
+        
+        for command in commands:
+            response = self._send_command(command)
+            if response is not None:
+                logger.info(f"Recalled preset {memory_slot}")
+                return True
+        
+        logger.error(f"Failed to recall preset {memory_slot}")
+        return False
+    
+    def get_status(self) -> Dict:
+        """
+        Get comprehensive power supply status.
+        
+        @return: Dictionary with detailed status information
+        """
+        status = {
+            'connected': self.is_connected,
+            'monitoring': self.monitoring,
+            'port': self.port,
+            'baudrate': self.baudrate
+        }
+        
+        if self.is_connected:
+            # Try to get output status
+            output_commands = ["OUTP?", "OUTPUT?", "OUT?"]
+            for cmd in output_commands:
+                response = self._send_command(cmd)
+                if response and ('1' in response or 'ON' in response.upper()):
+                    status['output_enabled'] = True
+                    break
+                elif response and ('0' in response or 'OFF' in response.upper()):
+                    status['output_enabled'] = False
+                    break
+            else:
+                status['output_enabled'] = None
+            
+            # Get current readings
+            readings = self.get_readings()
+            status.update(readings)
+        
+        return status
+    
+    def get_readings(self) -> Dict:
+        """
+        Get all power supply readings.
+        
+        @return: Dictionary with voltage, current, power
+        """
+        voltage = self.get_voltage()
+        current = self.get_current()
+        power = self.get_power()
+        
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'voltage': voltage,
+            'current': current,
+            'power': power
+        }
+    
+    def start_monitoring(self, interval: float = 1.0):
+        """
+        Start continuous monitoring of power supply readings.
+        
+        @param interval: Measurement interval in seconds
+        """
+        if self.monitoring:
+            return
+        
+        self.monitoring = True
+        self.data_log = []
+        
+        def monitor_loop():
+            while self.monitoring:
+                readings = self.get_readings()
+                self.data_log.append(readings)
+                logger.debug(f"Power: V={readings.get('voltage', 'N/A'):.2f}V, "
+                           f"I={readings.get('current', 'N/A'):.3f}A, "
+                           f"P={readings.get('power', 'N/A'):.2f}W")
+                time.sleep(interval)
+        
+        self.monitor_thread = threading.Thread(target=monitor_loop)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+        
+        logger.info("Started power monitoring")
+    
+    def stop_monitoring(self):
+        """Stop continuous monitoring"""
+        if self.monitoring:
+            self.monitoring = False
+            if self.monitor_thread and self.monitor_thread.is_alive():
+                self.monitor_thread.join()
+            logger.info("Stopped power monitoring")
+    
+    def save_log_to_csv(self, filename: str) -> bool:
+        """
+        Save logged data to CSV file.
+        
+        @param filename: Output CSV filename
+        @return: True if successful
+        """
+        if not self.data_log:
+            logger.warning("No data to save")
+            return False
+        
+        try:
+            with open(filename, 'w', newline='') as csvfile:
+                fieldnames = ['timestamp', 'voltage', 'current', 'power']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for reading in self.data_log:
+                    # Convert None values to 0 for CSV
+                    row = {}
+                    for key in fieldnames:
+                        value = reading.get(key)
+                        row[key] = value if value is not None else (0 if key != 'timestamp' else reading.get('timestamp', ''))
+                    writer.writerow(row)
+            
+            logger.info(f"Saved {len(self.data_log)} readings to {filename}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save CSV: {e}")
+            return False
+    
+    def save_log_to_excel(self, filename: str) -> bool:
+        """
+        Save logged data to Excel file with formatting and charts.
+        
+        @param filename: Output Excel filename
+        @return: True if successful
+        """
+        if not self.data_log:
+            logger.warning("No data to save")
+            return False
+        
+        try:
+            import pandas as pd
+            from datetime import datetime
+            
+            # Convert data to DataFrame
+            df_data = []
+            for reading in self.data_log:
+                row = {
+                    'timestamp': reading.get('timestamp', ''),
+                    'voltage': reading.get('voltage', 0),
+                    'current': reading.get('current', 0),
+                    'power': reading.get('power', 0)
+                }
+                df_data.append(row)
+            
+            df = pd.DataFrame(df_data)
+            
+            # Create Excel writer with formatting
+            with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
+                df.to_excel(writer, sheet_name='Power Data', index=False)
+                
+                # Get workbook and worksheet objects
+                workbook = writer.book
+                worksheet = writer.sheets['Power Data']
+                
+                # Add formatting
+                header_format = workbook.add_format({
+                    'bold': True,
+                    'text_wrap': True,
+                    'valign': 'top',
+                    'fg_color': '#D7E4BC',
+                    'border': 1
+                })
+                
+                # Format headers
+                for col_num, value in enumerate(df.columns.values):
+                    worksheet.write(0, col_num, value, header_format)
+                
+                # Create charts
+                chart = workbook.add_chart({'type': 'line'})
+                
+                max_row = len(df) + 1
+                
+                # Add voltage series
+                chart.add_series({
+                    'name': 'Voltage (V)',
+                    'categories': ['Power Data', 1, 0, max_row, 0],
+                    'values': ['Power Data', 1, 1, max_row, 1],
+                    'line': {'color': 'blue', 'width': 2}
+                })
+                
+                # Add current series  
+                chart.add_series({
+                    'name': 'Current (A)',
+                    'categories': ['Power Data', 1, 0, max_row, 0],
+                    'values': ['Power Data', 1, 2, max_row, 2],
+                    'line': {'color': 'red', 'width': 2},
+                    'y2_axis': True
+                })
+                
+                # Configure chart
+                chart.set_title({'name': 'P6000 Power Supply Data'})
+                chart.set_x_axis({'name': 'Time'})
+                chart.set_y_axis({'name': 'Voltage (V)', 'major_gridlines': {'visible': True}})
+                chart.set_y2_axis({'name': 'Current (A)'})
+                chart.set_size({'width': 720, 'height': 480})
+                
+                # Insert chart
+                worksheet.insert_chart('F2', chart)
+            
+            logger.info(f"Saved {len(self.data_log)} readings to {filename}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save Excel: {e}")
+            return False
+    
+    def plot_data(self, show_plot: bool = True, save_plot: Optional[str] = None) -> bool:
+        """
+        Plot logged power supply data.
+        
+        @param show_plot: Whether to display the plot
+        @param save_plot: Filename to save plot (optional)
+        @return: True if successful
+        """
+        if not self.data_log:
+            logger.warning("No data to plot")
+            return False
+        
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from datetime import datetime
+            
+            # Extract data
+            timestamps = []
+            voltages = []
+            currents = []
+            powers = []
+            
+            for reading in self.data_log:
+                try:
+                    ts = datetime.fromisoformat(reading.get('timestamp', ''))
+                    timestamps.append(ts)
+                    voltages.append(reading.get('voltage', 0))
+                    currents.append(reading.get('current', 0))
+                    powers.append(reading.get('power', 0))
+                except:
+                    continue
+            
+            if not timestamps:
+                logger.error("No valid timestamp data to plot")
+                return False
+            
+            # Create subplots
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+            
+            # Voltage plot
+            ax1.plot(timestamps, voltages, 'b-', linewidth=2, label='Voltage')
+            ax1.set_ylabel('Voltage (V)', color='b')
+            ax1.tick_params(axis='y', labelcolor='b')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_title('P6000 Power Supply Data')
+            
+            # Current plot
+            ax2.plot(timestamps, currents, 'r-', linewidth=2, label='Current')
+            ax2.set_ylabel('Current (A)', color='r')
+            ax2.tick_params(axis='y', labelcolor='r')
+            ax2.grid(True, alpha=0.3)
+            
+            # Power plot
+            ax3.plot(timestamps, powers, 'g-', linewidth=2, label='Power')
+            ax3.set_ylabel('Power (W)', color='g')
+            ax3.tick_params(axis='y', labelcolor='g')
+            ax3.grid(True, alpha=0.3)
+            ax3.set_xlabel('Time')
+            
+            # Format x-axis
+            ax3.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+            ax3.xaxis.set_major_locator(mdates.SecondLocator(interval=10))
+            plt.xticks(rotation=45)
+            
+            plt.tight_layout()
+            
+            if save_plot:
+                plt.savefig(save_plot, dpi=300, bbox_inches='tight')
+                logger.info(f"Plot saved to {save_plot}")
+            
+            if show_plot:
+                plt.show()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to plot data: {e}")
+            return False
+    
+    def __enter__(self):
+        """Context manager entry"""
+        self.connect()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.output_off()
+        self.disconnect()
+
+
+# Test functions for standalone use
+def test_power_supply(port: str = "COM1"):
+    """
+    Test power supply functionality.
+    
+    @param port: Serial port to test
+    """
+    print(f"Testing P6000 Power Supply on {port}")
+    
+    with P6000PowerSupply(port) as psu:
+        if not psu.is_connected:
+            print("Failed to connect to power supply")
+            return
+        
+        # Test basic operations
+        print("Setting voltage to 12V...")
+        psu.set_voltage(12.0)
+        
+        print("Setting current limit to 1A...")
+        psu.set_current(1.0)
+        
+        print("Turning output ON...")
+        psu.output_on()
+        
+        time.sleep(2)
+        
+        # Read measurements
+        readings = psu.get_readings()
+        print(f"Readings: {readings}")
+        
+        print("Starting monitoring for 10 seconds...")
+        psu.start_monitoring(interval=0.5)
+        time.sleep(10)
+        psu.stop_monitoring()
+        
+        print("Turning output OFF...")
+        psu.output_off()
+        
+        # Save data
+        psu.save_log_to_csv("power_test.csv")
+        print("Test completed")
+
+
+if __name__ == "__main__":
+    import sys
+    
+    port = sys.argv[1] if len(sys.argv) > 1 else "COM1"
+    test_power_supply(port)
