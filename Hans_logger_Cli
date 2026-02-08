@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+Interactive Hans-Rudolph Control CLI
+
+This script provides a simple command-line interface to control a Hans-Rudolph device
+using the HansLibrary. Commands include opening the port, starting/stopping data output,
+reading a single data row, setting breath rate, amplitude, loading configuration, and more.
+
+Usage:
+  python hans_cli.py
+  > open COM3            # open serial port
+  > start                # start continuous data output
+  > row                  # read one data row
+  > stop                 # stop data output
+  > rate 30              # set breath rate to 30 BPM
+  > amp 100              # set amplitude to 100
+  > load config1.cfg     # load configuration file
+  > collect 60           # collect 60 seconds of data (CSV to stdout)
+  > close                # close serial port
+  > quit                 # exit CLI
+"""
+import sys
+import time
+try:
+    import serial
+except ImportError:
+    print("Error: 'pyserial' is required. Install with 'pip install pyserial'", file=sys.stderr)
+    sys.exit(1)
+
+from HansLibrary import HansRudolphComm
+
+
+def print_help():
+    cmds = [
+        ("help", "0", "Show this help message"),
+        ("open <port>", "1", "Open serial port (e.g. COM3 or /dev/ttyUSB0)"),
+        ("start", "2", "Start continuous data output"),
+        ("row", "3", "Read one data row (single packet)"),
+        ("stop", "4", "Stop data output"),
+        ("rate <value>", "5", "Set breath rate (1-99 BPM)"),
+        ("amp <value>", "6", "Set amplitude"),
+        ("load <filename>", "7", "Load device configuration file"),
+        ("collect <sec> <filename>", "8", "Collect data (default: 60 sec to data.csv)"),
+        ("wait <breaths>", "9", "Wait for specified number of breaths"),
+        ("close", "10", "Close the serial port"),
+        ("quit", "11", "Exit this CLI")
+    ]
+    print("Available commands:")
+    for cmd, num, desc in cmds:
+        print(f"  {num:>2}. {cmd:<30} {desc}")
+
+
+def main():
+    hans = HansRudolphComm()
+    port = None
+    print("Hans-Rudolph CLI. Type 'help' or '0' for a list of commands.")
+    while True:
+        try:
+            line = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+        if not line:
+            continue
+        parts = line.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        # Handle numeric commands
+        if cmd.isdigit():
+            cmd_map = {
+                '0': 'help', '1': 'open', '2': 'start', '3': 'row', '4': 'stop',
+                '5': 'rate', '6': 'amp', '7': 'load', '8': 'collect', '9': 'wait', '10': 'close', '11': 'quit'
+            }
+            cmd = cmd_map.get(cmd, cmd)
+
+        if cmd in ('quit', 'exit'):
+            break
+        if cmd == 'help':
+            print_help()
+
+        elif cmd == 'open':
+            if len(args) != 1:
+                print("Usage: open <port>")
+                continue
+            try:
+                port = serial.Serial(args[0], 19200, timeout=1)
+                print(f"Port opened: {args[0]}")
+            except Exception as e:
+                print(f"Error opening port: {e}")
+
+        elif cmd == 'close':
+            if port:
+                try:
+                    hans.hans_stop_data_output(port)
+                    print("Data output stopped")
+                except Exception as e:
+                    print(f"Error stopping data output: {e}")
+                port.close()
+                print("Port closed")
+                port = None
+            else:
+                print("No port to close")
+
+        elif cmd == 'start':
+            if not port:
+                print("Open a port first")
+            else:
+                hans.hans_start_data_output(port)
+                print("Data output started")
+
+        elif cmd == 'stop':
+            if not port:
+                print("Open a port first")
+            else:
+                hans.hans_stop_data_output(port)
+                print("Data output stopped")
+
+        elif cmd == 'row':
+            if not port:
+                print("Open a port first")
+            else:
+                data = hans.hans_get_row(port, timeout=5)
+                if data:
+                    print("Data row:", data)
+                else:
+                    print("No data received (timeout)")
+
+        elif cmd == 'rate':
+            if not port or len(args) != 1:
+                print("Usage: rate <value>")
+            else:
+                try:
+                    br = int(args[0])
+                    hans.set_breath_rate(port, br)
+                    print(f"Breath rate set to {br} BPM")
+                except Exception as e:
+                    print(f"Error setting rate: {e}")
+
+        elif cmd == 'amp':
+            if not port or len(args) != 1:
+                print("Usage: amp <value>")
+            else:
+                try:
+                    am = float(args[0])
+                    hans.set_amplitude(port, am)
+                    print(f"Amplitude set to {am}")
+                except Exception as e:
+                    print(f"Error setting amplitude: {e}")
+
+        elif cmd == 'load':
+            if not port or len(args) != 1:
+                print("Usage: load <filename>")
+            else:
+                hans.load_configuration(port, args[0])
+                print(f"Configuration '{args[0]}' loaded")
+
+        elif cmd == 'collect':
+            if not port:
+                print("Open a port first")
+            else:
+                try:
+                    # Timestamp-based default values (YYYY-MM-DD_HH-MM-SS)
+                    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+                    duration = 60
+                    # default filename: <YYYY-MM-DD_HH-MM-SS>_<duration>s.csv
+                    filename = f"{ts}_{duration}s.csv"
+                    
+                    # Parse arguments and update defaults
+                    if len(args) >= 1:
+                        duration = int(args[0])
+                        # update filename with new duration
+                        filename = f"{ts}_{duration}s.csv"
+                    if len(args) >= 2:
+                        filename = args[1]
+                    
+                    print(f"Collecting {duration} seconds of data to '{filename}'...")
+                    
+                    # Open file or use stdout
+                    if filename.lower() in ('stdout', '-'):
+                        file_obj = sys.stdout
+                    else:
+                        file_obj = open(filename, 'w')
+                    
+                    try:
+                        hans.start_hans_data_collection(
+                            port=port,
+                            duration=duration,
+                            file_obj=file_obj,
+                            need_header=True
+                        )
+                        if file_obj != sys.stdout:
+                            print(f"Data saved to '{filename}'")
+                    finally:
+                        if file_obj != sys.stdout:
+                            file_obj.close()
+                            
+                except ValueError:
+                    print("Error: duration must be a number")
+                except Exception as e:
+                    print(f"Error during collection: {e}")
+
+        elif cmd == 'wait':
+            if not port or len(args) != 1:
+                print("Usage: wait <breaths>")
+            else:
+                try:
+                    breaths = int(args[0])
+                    hans.wait_for_breaths(port, breaths)
+                    print(f"Waiting for {breaths} breaths...")
+                except ValueError:
+                    print("Error: number of breaths must be a non-negative number")
+                except Exception as e:
+                    print(f"Error sending wait command: {e}")
+
+        else:
+            print(f"Unknown command: {cmd}")
+
+    if port:
+        try:
+            hans.hans_stop_data_output(port)
+            print("Data output stopped")
+        except Exception as e:
+            print(f"Error stopping data output: {e}")
+        port.close()
+        print("Port closed")
+    print("Goodbye!")
+
+
+if __name__ == '__main__':
+    main()
